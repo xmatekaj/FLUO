@@ -1,0 +1,35 @@
+name: fluo
+description: "FLUO – W-MBus Water Meter Reader for Android"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # USB serial (USB OTG – CDC-ACM, FTDI, CP210x, CH34x)
+  usb_serial: ^0.5.2
+
+  # AES-128-CBC decryption
+  encrypt: ^5.0.3
+
+  # CSV file picker & parsing
+  file_picker: ^8.1.7
+  csv: ^6.0.0
+
+  # Share / export results
+  share_plus: ^10.1.4
+  path_provider: ^2.1.5
+
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
