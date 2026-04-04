@@ -3,10 +3,10 @@
 
 import 'dart:async';
 import 'dart:math' as math;
-import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:share_plus/share_plus.dart' show Share, XFile;
 
 import '../models/meter.dart';
@@ -110,6 +110,16 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     } catch (e) {
       _showError('Load error', e.toString());
     }
+  }
+
+  Future<void> _downloadTemplate() async {
+    final data = await rootBundle.load('assets/meters_template.csv');
+    final bytes = data.buffer.asUint8List();
+    final path = await saveCsvFile(String.fromCharCodes(bytes), 'meters_template.csv');
+    await Share.shareXFiles(
+      [XFile(path, mimeType: 'text/csv')],
+      subject: 'meters_template.csv',
+    );
   }
 
   // ── Connect / Disconnect ───────────────────────────────────────────────────
@@ -690,6 +700,15 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                 ),
                 onPressed: _loadMetersFile,
+              ),
+              const SizedBox(width: 6),
+              ElevatedButton.icon(
+                icon: const Icon(Icons.download, size: 14),
+                label: const Text('Template', style: TextStyle(fontSize: 12)),
+                style: ElevatedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                ),
+                onPressed: _downloadTemplate,
               ),
             ],
           ),
