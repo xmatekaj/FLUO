@@ -293,24 +293,39 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
     double? volumeM3;
     List<String> alarms = ['OK'];
+    List<HistoryEntry> hist = [];
 
     if (isApa162Payload(Uint8List.fromList(pt))) {
       final r = parseApa162Payload(Uint8List.fromList(pt));
       volumeM3 = r.totalM3;
+      // Convert Apa162 monthly offsets to approximate end-of-month dates
+      final now = DateTime.now();
+      hist = r.history.map((h) {
+        int m = now.month - h.month;
+        int y = now.year;
+        if (m <= 0) { m += 12; y -= 1; }
+        final date = DateTime(y, m + 1, 0, 23, 59); // last day of that month
+        return HistoryEntry(date: date, volumeM3: h.volumeM3);
+      }).toList();
     } else {
       final oms = parseOmsPayload(Uint8List.fromList(pt));
       volumeM3 = oms.volumeM3;
       alarms   = decodeAlarms(oms.faultsWord);
+      hist     = buildHistoryDates(oms.history, oms.timestamp)
+          .map((h) => HistoryEntry(date: h.date, volumeM3: h.volumeM3))
+          .toList();
     }
 
     final keyTag = usedZeroKey ? ' [zero-key]' : '';
-    _addLog('ID=$radio (A162)$keyTag  vol=${volumeM3?.toStringAsFixed(3)} m³');
+    _addLog('ID=$radio (A162)$keyTag  vol=${volumeM3?.toStringAsFixed(3)} m³'
+        '${hist.isNotEmpty ? "  hist=${hist.length}" : ""}');
 
     setState(() {
       meter.status   = MeterStatus.ok;
       meter.volumeM3 = volumeM3;
       meter.readAt   = DateTime.now();
       meter.alarms   = alarms;
+      meter.history  = hist;
     });
   }
 
@@ -416,6 +431,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       final nEnc    = (tplCfg >> 4) & 0x0F;
 
       double? volumeM3;
+      List<HistoryEntry> hist = [];
       bool decrypted = false;
 
       if (secMode == 5) {
@@ -430,18 +446,29 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             if (isApa162Payload(Uint8List.fromList(pt))) {
               final r = parseApa162Payload(Uint8List.fromList(pt));
               volumeM3 = r.totalM3;
+              final now = DateTime.now();
+              hist = r.history.map((h) {
+                int m = now.month - h.month;
+                int y = now.year;
+                if (m <= 0) { m += 12; y -= 1; }
+                return HistoryEntry(date: DateTime(y, m + 1, 0, 23, 59), volumeM3: h.volumeM3);
+              }).toList();
             } else {
               final oms = parseOmsPayload(Uint8List.fromList(pt));
               volumeM3 = oms.volumeM3;
+              hist = buildHistoryDates(oms.history, oms.timestamp)
+                  .map((h) => HistoryEntry(date: h.date, volumeM3: h.volumeM3))
+                  .toList();
             }
           }
         }
       }
-      _addLog('ID=$radio (A162) → ${decrypted ? "✅ zero-key vol=${volumeM3?.toStringAsFixed(3)} m³" : "❌ decrypt failed"}');
+      _addLog('ID=$radio (A162) → ${decrypted ? "✅ zero-key vol=${volumeM3?.toStringAsFixed(3)} m³  hist=${hist.length}" : "❌ decrypt failed"}');
       meter = UnknownMeter(
         radioNum: radio,
         kind:     decrypted ? UnknownMeterKind.zeroKeyOk : UnknownMeterKind.zeroKeyFail,
         totalM3:  volumeM3,
+        history:  hist,
         readAt:   DateTime.now(),
       );
     }
@@ -455,6 +482,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       double? volumeM3;
       DateTime? timestamp;
       List<String> alarms = [];
+      List<HistoryEntry> hist = [];
       bool decrypted = false;
 
       if (secMode == 5) {
@@ -470,16 +498,20 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             volumeM3  = oms.volumeM3;
             timestamp = oms.timestamp;
             alarms    = decodeAlarms(oms.faultsWord);
+            hist = buildHistoryDates(oms.history, oms.timestamp)
+                .map((h) => HistoryEntry(date: h.date, volumeM3: h.volumeM3))
+                .toList();
           }
         }
       }
-      _addLog('ID=$radio → ${decrypted ? "✅ zero-key vol=${volumeM3?.toStringAsFixed(3)} m³" : "❌ unknown encrypted"}');
+      _addLog('ID=$radio → ${decrypted ? "✅ zero-key vol=${volumeM3?.toStringAsFixed(3)} m³  hist=${hist.length}" : "❌ unknown encrypted"}');
       meter = UnknownMeter(
         radioNum: radio,
         kind:     decrypted ? UnknownMeterKind.zeroKeyOk : UnknownMeterKind.zeroKeyFail,
         totalM3:  volumeM3,
         currDate: timestamp,
         alarms:   alarms,
+        history:  hist,
         readAt:   DateTime.now(),
       );
     }
@@ -889,6 +921,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       color: bg,
       child: ListTile(
         dense: true,
+        onTap: () => _showUnknownDetail(context, m),
         leading: Icon(
           m.kind == UnknownMeterKind.techHca ? Icons.thermostat_outlined : Icons.water_drop_outlined,
           color: fg,
@@ -905,6 +938,108 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         subtitle: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: subtitleLines,
+        ),
+      ),
+    );
+  }
+
+  void _showUnknownDetail(BuildContext context, UnknownMeter m) {
+    final alarmList = m.alarms.where((a) => a != 'OK').toList();
+
+    Widget row(String label, String value) => Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        SizedBox(width: 110, child: Text(label, style: const TextStyle(fontSize: 13, color: Colors.grey))),
+        Expanded(child: Text(value, style: const TextStyle(fontSize: 13))),
+      ]),
+    );
+
+    Widget section(String title) => Padding(
+      padding: const EdgeInsets.only(top: 12, bottom: 4),
+      child: Text(title, style: TextStyle(
+        fontSize: 12, fontWeight: FontWeight.bold,
+        color: Colors.blueGrey.shade700, letterSpacing: 0.5,
+      )),
+    );
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (_) => DraggableScrollableSheet(
+        initialChildSize: 0.5,
+        minChildSize: 0.3,
+        maxChildSize: 0.9,
+        expand: false,
+        builder: (_, sc) => ListView(
+          controller: sc,
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+          children: [
+            Center(child: Container(
+              width: 40, height: 4,
+              margin: const EdgeInsets.only(bottom: 12),
+              decoration: BoxDecoration(color: Colors.grey.shade400, borderRadius: BorderRadius.circular(2)),
+            )),
+
+            Text('ID: ${m.radioNum}', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 4),
+            Text(m.kindLabel, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+            const Divider(height: 20),
+
+            row('Frames received', '${m.frameCount}'),
+            row('Last seen', _fmtDate(m.readAt)),
+
+            if (m.kind == UnknownMeterKind.techWater || m.kind == UnknownMeterKind.zeroKeyOk) ...[
+              section('Reading'),
+              if (m.totalM3 != null) row('Total volume', '${m.totalM3!.toStringAsFixed(3)} m³'),
+              if (m.prevM3 != null)  row('Previous period', '${m.prevM3!.toStringAsFixed(3)} m³  @ ${_fmtDate(m.prevDate)}'),
+              if (m.currM3 != null)  row('Current period',  '${m.currM3!.toStringAsFixed(3)} m³  @ ${_fmtDate(m.currDate)}'),
+            ],
+
+            if (m.kind == UnknownMeterKind.techHca) ...[
+              section('Heat cost allocator'),
+              if (m.prevHca != null) row('Previous HCA', '${m.prevHca}  @ ${_fmtDate(m.prevDate)}'),
+              if (m.currHca != null) row('Current HCA',  '${m.currHca}  @ ${_fmtDate(m.currDate)}'),
+              if (m.tempRoomC != null)     row('Room temp',     '${m.tempRoomC!.toStringAsFixed(1)} °C'),
+              if (m.tempRadiatorC != null) row('Radiator temp', '${m.tempRadiatorC!.toStringAsFixed(1)} °C'),
+            ],
+
+            if (alarmList.isNotEmpty) ...[
+              section('Alarms'),
+              ...alarmList.map((a) => Padding(
+                padding: const EdgeInsets.symmetric(vertical: 2),
+                child: Row(children: [
+                  const Icon(Icons.warning_amber_rounded, size: 16, color: Colors.orange),
+                  const SizedBox(width: 6),
+                  Text(a, style: const TextStyle(fontSize: 13)),
+                ]),
+              )),
+            ],
+
+            if (m.history.isNotEmpty) ...[
+              section('History'),
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Row(children: const [
+                  SizedBox(width: 130, child: Text('Date', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.grey))),
+                  Text('Volume (m³)', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.grey)),
+                ]),
+              ),
+              ...m.history.map((h) => Padding(
+                padding: const EdgeInsets.symmetric(vertical: 2),
+                child: Row(children: [
+                  SizedBox(width: 130, child: Text(
+                    h.date != null ? _fmtDate(h.date) : '—',
+                    style: const TextStyle(fontSize: 13),
+                  )),
+                  Text(h.volumeM3.toStringAsFixed(3),
+                      style: const TextStyle(fontSize: 13, fontFamily: 'monospace')),
+                ]),
+              )),
+            ],
+          ],
         ),
       ),
     );

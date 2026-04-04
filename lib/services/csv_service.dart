@@ -79,28 +79,45 @@ List<Meter> parseMeters(String csvContent) {
   return meters;
 }
 
-/// Export results to a CSV string.
+String _fmtDate(DateTime? dt) {
+  if (dt == null) return '';
+  return '${dt.year}-${dt.month.toString().padLeft(2,'0')}-${dt.day.toString().padLeft(2,'0')}';
+}
+
+String _fmtDateTime(DateTime dt) =>
+    '${_fmtDate(dt)} ${dt.hour.toString().padLeft(2,'0')}:${dt.minute.toString().padLeft(2,'0')}:${dt.second.toString().padLeft(2,'0')}';
+
+/// Export results to a CSV string (one row per meter + history in separate rows).
 String exportToCsv(List<Meter> meters) {
   final rows = <List<String>>[
     ['Building', 'Staircase', 'Apartment', 'Meter S/N', 'Radio ID',
-     'Status', 'Volume (m³)', 'Read at', 'Alarms'],
+     'Status', 'Volume (m³)', 'Read at', 'Alarms',
+     'History date', 'History volume (m³)'],
   ];
   for (final m in meters) {
-    rows.add([
-      m.building,
-      m.staircase,
-      m.apartment,
-      m.serial,
-      m.displayId,
-      m.status.label,
-      m.volumeM3?.toStringAsFixed(3) ?? '',
-      m.readAt != null
-          ? '${m.readAt!.hour.toString().padLeft(2, '0')}:'
-            '${m.readAt!.minute.toString().padLeft(2, '0')}:'
-            '${m.readAt!.second.toString().padLeft(2, '0')}'
-          : '',
-      m.alarms.where((a) => a != 'OK').join(', '),
-    ]);
+    final alarms = m.alarms.where((a) => a != 'OK').join(', ');
+    final readAt = m.readAt != null ? _fmtDateTime(m.readAt!) : '';
+    final vol    = m.volumeM3?.toStringAsFixed(3) ?? '';
+
+    if (m.history.isEmpty) {
+      rows.add([
+        m.building, m.staircase, m.apartment, m.serial, m.displayId,
+        m.status.label, vol, readAt, alarms, '', '',
+      ]);
+    } else {
+      // First row: meter info + first history entry
+      rows.add([
+        m.building, m.staircase, m.apartment, m.serial, m.displayId,
+        m.status.label, vol, readAt, alarms,
+        _fmtDate(m.history.first.date),
+        m.history.first.volumeM3.toStringAsFixed(3),
+      ]);
+      // Additional rows: only history (building etc. empty for readability)
+      for (final h in m.history.skip(1)) {
+        rows.add(['', '', '', '', '', '', '', '', '',
+          _fmtDate(h.date), h.volumeM3.toStringAsFixed(3)]);
+      }
+    }
   }
   return const ListToCsvConverter(fieldDelimiter: ';').convert(rows);
 }

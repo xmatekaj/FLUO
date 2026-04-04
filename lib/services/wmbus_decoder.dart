@@ -618,19 +618,22 @@ Apa162Result parseApa162Payload(Uint8List payload) {
           (payload[i + 3] << 24);
       result.totalM3 = double.parse((litres / 1000.0).toStringAsFixed(3));
     } else if (tag >= 0x71 && tag <= 0x7B) {
-      // Monthly history: first byte = count, then count×4B cumulative litres
-      final count = payload[i];
+      // First byte is a type/mode byte (not a count) — number of entries is
+      // determined by the tag: n = (size - 1) / 4  (same as Python decoder).
+      final nVals = (size - 1) ~/ 4;
       final entries = <Apa162HistEntry>[];
-      for (int m = 0; m < count && i + 1 + m * 4 + 4 <= payload.length; m++) {
+      for (int m = 0; m < nVals && i + 1 + m * 4 + 4 <= payload.length; m++) {
         final off = i + 1 + m * 4;
         final litres = payload[off] |
             (payload[off + 1] << 8) |
             (payload[off + 2] << 16) |
             (payload[off + 3] << 24);
-        entries.add(Apa162HistEntry(
-          month:    m + 1,
-          volumeM3: double.parse((litres / 1000.0).toStringAsFixed(3)),
-        ));
+        if (litres > 0) {
+          entries.add(Apa162HistEntry(
+            month:    m + 1,
+            volumeM3: double.parse((litres / 1000.0).toStringAsFixed(3)),
+          ));
+        }
       }
       if (result.history.isEmpty) result.history = entries;
     }

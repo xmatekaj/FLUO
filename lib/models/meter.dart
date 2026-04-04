@@ -87,6 +87,8 @@ class UnknownMeter {
   double? tempRoomC;
   double? tempRadiatorC;
 
+  List<HistoryEntry> history;
+
   DateTime readAt;
   int frameCount;
 
@@ -104,9 +106,11 @@ class UnknownMeter {
     this.currHca,
     this.tempRoomC,
     this.tempRadiatorC,
+    List<HistoryEntry>? history,
     required this.readAt,
     this.frameCount = 1,
-  }) : alarms = alarms ?? [];
+  })  : alarms = alarms ?? [],
+        history = history ?? [];
 
   bool get isDecoded =>
       kind == UnknownMeterKind.techWater ||
