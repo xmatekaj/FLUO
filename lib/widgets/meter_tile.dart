@@ -33,7 +33,10 @@ String _fmtTime(DateTime dt) =>
     '${dt.minute.toString().padLeft(2,'0')}:'
     '${dt.second.toString().padLeft(2,'0')}';
 
-void _showMeterDetail(BuildContext context, Meter meter) {
+void _showMeterDetail(BuildContext context, Meter meter, {
+  int pendingCount = 0,
+  void Function(String keyHex)? onEnterKey,
+}) {
   final fg = _statusTextColor(meter.status);
   final alarmList = meter.alarms.where((a) => a != 'OK').toList();
 
@@ -137,6 +140,21 @@ void _showMeterDetail(BuildContext context, Meter meter) {
               padding: EdgeInsets.only(top: 16),
               child: Text('No data received yet.', style: TextStyle(color: Colors.grey)),
             ),
+
+          // ── Key entry for keyless meters ──────────────────────────────────
+          if (onEnterKey != null) ...[
+            const SizedBox(height: 16),
+            _SectionHeader('AES Key'),
+            if (pendingCount > 0)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Text(
+                  '$pendingCount encrypted frame(s) buffered — enter key to decrypt.',
+                  style: const TextStyle(fontSize: 12, color: Colors.orange),
+                ),
+              ),
+            _KeyEntryField(onEnterKey: onEnterKey),
+          ],
         ],
       ),
     ),
@@ -185,11 +203,66 @@ class _InfoRow extends StatelessWidget {
   );
 }
 
+class _KeyEntryField extends StatefulWidget {
+  final void Function(String keyHex) onEnterKey;
+  const _KeyEntryField({required this.onEnterKey});
+  @override
+  State<_KeyEntryField> createState() => _KeyEntryFieldState();
+}
+
+class _KeyEntryFieldState extends State<_KeyEntryField> {
+  final _ctrl = TextEditingController();
+  String? _error;
+
+  void _submit() {
+    final hex = _ctrl.text.trim().replaceAll(' ', '').toUpperCase();
+    if (hex.length != 32 || !RegExp(r'^[0-9A-F]+$').hasMatch(hex)) {
+      setState(() => _error = 'Key must be exactly 32 hex characters');
+      return;
+    }
+    setState(() => _error = null);
+    widget.onEnterKey(hex);
+    Navigator.of(context).pop();
+  }
+
+  @override
+  void dispose() { _ctrl.dispose(); super.dispose(); }
+
+  @override
+  Widget build(BuildContext context) => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      TextField(
+        controller: _ctrl,
+        decoration: InputDecoration(
+          isDense: true,
+          hintText: '32 hex characters (e.g. 0011AABB…)',
+          errorText: _error,
+          border: const OutlineInputBorder(),
+          contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+        ),
+        style: const TextStyle(fontSize: 12, fontFamily: 'monospace'),
+        maxLength: 32,
+        keyboardType: TextInputType.text,
+        onSubmitted: (_) => _submit(),
+      ),
+      const SizedBox(height: 4),
+      ElevatedButton.icon(
+        icon: const Icon(Icons.lock_open, size: 16),
+        label: const Text('Decrypt buffered frames'),
+        onPressed: _submit,
+      ),
+    ],
+  );
+}
+
 class MeterTile extends StatelessWidget {
   final int index;
   final Meter meter;
   final VoidCallback onConfirm;
   final VoidCallback onReset;
+  final int pendingCount;
+  final void Function(String keyHex)? onEnterKey;
 
   const MeterTile({
     super.key,
@@ -197,6 +270,8 @@ class MeterTile extends StatelessWidget {
     required this.meter,
     required this.onConfirm,
     required this.onReset,
+    this.pendingCount = 0,
+    this.onEnterKey,
   });
 
   @override
@@ -209,7 +284,11 @@ class MeterTile extends StatelessWidget {
       color: bg,
       child: ListTile(
         dense: true,
-        onTap: () => _showMeterDetail(context, meter),
+        onTap: () => _showMeterDetail(
+          context, meter,
+          pendingCount: pendingCount,
+          onEnterKey: meter.status == MeterStatus.noKey ? onEnterKey : null,
+        ),
         leading: CircleAvatar(
           radius: 14,
           backgroundColor: bg == const Color(0xFFF5F5F5)
@@ -233,6 +312,19 @@ class MeterTile extends StatelessWidget {
                 overflow: TextOverflow.ellipsis,
               ),
             ),
+            if (meter.status == MeterStatus.noKey && pendingCount > 0)
+              Container(
+                margin: const EdgeInsets.only(right: 4),
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                decoration: BoxDecoration(
+                  color: Colors.orange.shade700,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  '$pendingCount',
+                  style: const TextStyle(fontSize: 10, color: Colors.white, fontWeight: FontWeight.bold),
+                ),
+              ),
             Text(
               meter.status.label,
               style: TextStyle(fontSize: 12, color: fg),
@@ -261,10 +353,19 @@ class MeterTile extends StatelessWidget {
         ),
         trailing: PopupMenuButton<String>(
           icon: Icon(Icons.more_vert, size: 18, color: fg),
-          onSelected: (v) => v == 'confirm' ? onConfirm() : onReset(),
-          itemBuilder: (_) => const [
-            PopupMenuItem(value: 'confirm', child: Text('✅ Mark confirmed')),
-            PopupMenuItem(value: 'reset',   child: Text('⏳ Reset to pending')),
+          onSelected: (v) {
+            if (v == 'confirm') { onConfirm(); return; }
+            if (v == 'reset')   { onReset();   return; }
+            if (v == 'key') {
+              _showMeterDetail(context, meter,
+                pendingCount: pendingCount, onEnterKey: onEnterKey);
+            }
+          },
+          itemBuilder: (_) => [
+            const PopupMenuItem(value: 'confirm', child: Text('✅ Mark confirmed')),
+            const PopupMenuItem(value: 'reset',   child: Text('⏳ Reset to pending')),
+            if (meter.status == MeterStatus.noKey)
+              const PopupMenuItem(value: 'key', child: Text('🔑 Enter AES key')),
           ],
         ),
       ),

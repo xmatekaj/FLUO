@@ -30,6 +30,13 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   final List<UnknownMeter> _unknown = [];
   final Map<int, int> _unknownIndex = {}; // radioNum → index in _unknown
 
+  // Raw frame buffer (all received frames for export)
+  final List<({DateTime ts, int? radioNum, String reason, String hex})> _rawFrames = [];
+
+  // Pending frames for meters that are on the list but have no key yet.
+  // When meters CSV is reloaded with keys, these are retried.
+  final Map<int, List<Uint8List>> _pendingNoKey = {}; // radioNum → raw frames
+
   late final TabController _tabController;
 
   List<SerialDevice> _devices = [];
@@ -44,6 +51,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
   // Filter
   MeterStatus? _filterStatus;
+  final _unknownSearchCtrl = TextEditingController();
+  String _unknownSearch = '';
 
   // Subscriptions
   StreamSubscription<Uint8List>? _frameSub;
@@ -59,7 +68,18 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     final svc = SerialService.instance;
     svc.startMonitoring();
     _deviceSub = svc.devices.listen((devs) {
-      setState(() => _devices = devs);
+      setState(() {
+        _devices = devs;
+        // Keep selection only if the device is still in the list (by port name).
+        // Recreated SerialDevice objects won't be == the old one, so match by label.
+        if (_selectedDevice != null) {
+          _selectedDevice = devs.where((d) => d.label == _selectedDevice!.label).firstOrNull;
+        }
+        // Auto-select if exactly one device is available and nothing is selected.
+        if (_selectedDevice == null && devs.length == 1) {
+          _selectedDevice = devs.first;
+        }
+      });
     });
     _stateSub = svc.states.listen((s) {
       setState(() => _connected = s == SerialState.connected);
@@ -82,6 +102,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     _scrollLog.dispose();
     _scrollMeters.dispose();
     _scrollUnknown.dispose();
+    _unknownSearchCtrl.dispose();
     super.dispose();
   }
 
@@ -107,9 +128,28 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       final noInst = meters.where((m) => !m.isInstalled).length;
       _addLog('Loaded ${meters.length} meters '
           '($keys with key, $noInst not installed)  ← ${result.files.single.name}');
+      // Retry frames that arrived before a key was available
+      _retryPendingNoKey();
     } catch (e) {
       _showError('Load error', e.toString());
     }
+  }
+
+  void _retryPendingNoKey() {
+    if (_pendingNoKey.isEmpty) return;
+    int retried = 0;
+    for (final radio in List.of(_pendingNoKey.keys)) {
+      final idx = _radioIndex[radio];
+      if (idx == null) continue;
+      final meter = _meters[idx];
+      if (!meter.hasKey) continue; // still no key
+      for (final raw in _pendingNoKey[radio]!) {
+        _handleFrame(raw);
+        retried++;
+      }
+      _pendingNoKey.remove(radio);
+    }
+    if (retried > 0) _addLog('Retried $retried buffered frame(s) for meters that now have keys');
   }
 
   Future<void> _downloadTemplate() async {
@@ -137,20 +177,28 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     }
   }
 
+  // ── Raw frame buffer ───────────────────────────────────────────────────────
+  void _addRawFrame(Uint8List raw, {int? radioNum, String reason = 'ok'}) {
+    if (_rawFrames.length >= 2000) _rawFrames.removeAt(0); // cap at 2000
+    _rawFrames.add((
+      ts:       DateTime.now(),
+      radioNum: radioNum,
+      reason:   reason,
+      hex:      raw.map((b) => b.toRadixString(16).padLeft(2, '0')).join().toUpperCase(),
+    ));
+  }
+
   // ── Frame handling ─────────────────────────────────────────────────────────
   void _handleFrame(Uint8List raw) {
     final parsed = parseRawFrame(raw);
     if (parsed == null) {
-      debugPrint('WMBUS: parseRawFrame returned null, raw len=${raw.length}');
+      _addRawFrame(raw, reason: 'parse_error');
       return;
     }
 
     final radio = parsed.radioNum;
     final bd    = parsed.blockData;
-    debugPrint('WMBUS: frame radio=$radio crcOk=${parsed.crcOk} '
-        'M=${parsed.mBytes.map((b) => b.toRadixString(16).padLeft(2,"0")).join()} '
-        'CI=0x${bd.isNotEmpty ? bd[0].toRadixString(16) : "?"} '
-        'bdLen=${bd.length}');
+    _addRawFrame(raw, radioNum: radio);
 
     final idx   = _radioIndex[radio];
 
@@ -178,7 +226,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     // ── Apator AES-128-CBC (ELL + TPL mode 5) ─────────────────────────────
     final key = meter.aesKey;
     if (key == null) {
-      _addLog('ID=$radio → no key');
+      // Save raw frame for retry when key becomes available
+      _pendingNoKey.putIfAbsent(radio, () => []).add(raw);
+      _addLog('ID=$radio → no key (frame saved for retry)');
       setState(() => meter.status = MeterStatus.noKey);
       return;
     }
@@ -200,9 +250,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       return;
     }
 
-    final enc = (nEnc > 0)
-        ? bd.sublist(8, 8 + nEnc * 16)
-        : bd.sublist(8);
+    final encEnd = nEnc > 0 ? math.min(8 + nEnc * 16, bd.length) : bd.length;
+    final enc = bd.sublist(8, encEnd);
     final encAligned = enc.sublist(0, (enc.length ~/ 16) * 16);
     if (encAligned.length < 16) {
       setState(() => meter.status = MeterStatus.failed);
@@ -486,7 +535,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       bool decrypted = false;
 
       if (secMode == 5) {
-        final enc = (nEnc > 0) ? bd.sublist(8, 8 + nEnc * 16) : bd.sublist(8);
+        final encEnd3 = nEnc > 0 ? math.min(8 + nEnc * 16, bd.length) : bd.length;
+        final enc = bd.sublist(8, encEnd3);
         final encAligned = enc.sublist(0, (enc.length ~/ 16) * 16);
         if (encAligned.length >= 16) {
           final zeroKey = List<int>.filled(16, 0);
@@ -571,6 +621,26 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     );
   }
 
+  Future<void> _exportUnknown() async {
+    if (_unknown.isEmpty) { _showError('Nothing to export', 'No unknown meters received yet.'); return; }
+    final csv  = exportUnknownToCsv(_unknown);
+    final path = await saveCsvFile(csv, 'wmbus_unknown.csv');
+    await Share.shareXFiles(
+      [XFile(path, mimeType: 'text/csv')],
+      text: 'W-MBus unknown meters',
+    );
+  }
+
+  Future<void> _exportRawFrames() async {
+    if (_rawFrames.isEmpty) { _showError('Nothing to export', 'No frames received yet.'); return; }
+    final csv  = exportRawFramesToCsv(_rawFrames);
+    final path = await saveCsvFile(csv, 'wmbus_raw_frames.csv');
+    await Share.shareXFiles(
+      [XFile(path, mimeType: 'text/csv')],
+      text: 'W-MBus raw frames',
+    );
+  }
+
   // ── Reset all ─────────────────────────────────────────────────────────────
   void _resetAll() {
     showDialog(
@@ -626,8 +696,20 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         actions: [
           IconButton(icon: const Icon(Icons.refresh), tooltip: 'Refresh USB devices',
               onPressed: () => SerialService.instance.refreshDevices()),
-          IconButton(icon: const Icon(Icons.upload_file), tooltip: 'Export CSV',
-              onPressed: _export),
+          PopupMenuButton<String>(
+            icon: const Icon(Icons.upload_file),
+            tooltip: 'Export',
+            onSelected: (v) {
+              if (v == 'meters')  _export();
+              if (v == 'unknown') _exportUnknown();
+              if (v == 'raw')     _exportRawFrames();
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: 'meters',  child: Text('Export meters CSV')),
+              PopupMenuItem(value: 'unknown', child: Text('Export unknown meters CSV')),
+              PopupMenuItem(value: 'raw',     child: Text('Export raw frames CSV')),
+            ],
+          ),
           IconButton(icon: const Icon(Icons.restart_alt), tooltip: 'Reset all',
               onPressed: _resetAll),
         ],
@@ -807,11 +889,38 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         return MeterTile(
           index: globalIdx,
           meter: meter,
+          pendingCount: meter.radioNum != null
+              ? (_pendingNoKey[meter.radioNum]?.length ?? 0)
+              : 0,
           onConfirm: () => setState(() {
             meter.status = MeterStatus.ok;
             meter.readAt ??= DateTime.now();
           }),
           onReset: () => setState(() => meter.reset()),
+          onEnterKey: meter.radioNum == null ? null : (keyHex) {
+            final key = List.generate(
+              16, (i) => int.parse(keyHex.substring(i * 2, i * 2 + 2), radix: 16));
+            setState(() {
+              // Inject key directly into meter object
+              final idx2 = _radioIndex[meter.radioNum];
+              if (idx2 != null) {
+                final m = _meters[idx2];
+                // Replace meter with key
+                _meters[idx2] = Meter(
+                  building:  m.building,
+                  staircase: m.staircase,
+                  apartment: m.apartment,
+                  serial:    m.serial,
+                  radioNum:  m.radioNum,
+                  aesKey:    key,
+                  status:    MeterStatus.pending,
+                );
+                _radioIndex[m.radioNum!] = idx2;
+              }
+            });
+            _retryPendingNoKey();
+            _addLog('ID=${meter.radioNum} → key entered manually, retrying buffered frames');
+          },
         );
       },
     );
@@ -830,6 +939,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         ),
       );
     }
+    final filtered = _unknownSearch.isEmpty
+        ? _unknown
+        : _unknown.where((m) => m.radioNum.toString().contains(_unknownSearch)).toList();
+
     return Column(
       children: [
         Container(
@@ -837,7 +950,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
           child: Row(
             children: [
-              Text('${_unknown.length} unknown meter(s)',
+              Text('${filtered.length} / ${_unknown.length} unknown meter(s)',
                   style: const TextStyle(fontSize: 12)),
               const Spacer(),
               TextButton.icon(
@@ -851,12 +964,34 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             ],
           ),
         ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          child: TextField(
+            controller: _unknownSearchCtrl,
+            decoration: InputDecoration(
+              isDense: true,
+              hintText: 'Search by radio ID…',
+              prefixIcon: const Icon(Icons.search, size: 18),
+              suffixIcon: _unknownSearch.isEmpty ? null : IconButton(
+                icon: const Icon(Icons.clear, size: 18),
+                onPressed: () => setState(() {
+                  _unknownSearchCtrl.clear();
+                  _unknownSearch = '';
+                }),
+              ),
+              border: const OutlineInputBorder(),
+              contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+            ),
+            keyboardType: TextInputType.number,
+            onChanged: (v) => setState(() => _unknownSearch = v.trim()),
+          ),
+        ),
         Expanded(
           child: ListView.separated(
             controller: _scrollUnknown,
-            itemCount: _unknown.length,
+            itemCount: filtered.length,
             separatorBuilder: (_, __) => const Divider(height: 1),
-            itemBuilder: (_, i) => _buildUnknownTile(_unknown[i]),
+            itemBuilder: (_, i) => _buildUnknownTile(filtered[i]),
           ),
         ),
       ],

@@ -122,6 +122,46 @@ String exportToCsv(List<Meter> meters) {
   return const ListToCsvConverter(fieldDelimiter: ';').convert(rows);
 }
 
+/// Export unknown meters to CSV string.
+String exportUnknownToCsv(List<UnknownMeter> unknown) {
+  final rows = <List<String>>[
+    ['Radio ID', 'Kind', 'Total (m³)', 'Prev (m³)', 'Curr (m³)',
+     'Prev date', 'Curr date', 'Alarms', 'Frames', 'Last seen'],
+  ];
+  for (final m in unknown) {
+    final alarms = m.alarms.where((a) => a != 'OK').join(', ');
+    rows.add([
+      m.radioNum.toString(),
+      m.kindLabel,
+      m.totalM3?.toStringAsFixed(3) ?? '',
+      m.prevM3?.toStringAsFixed(3) ?? '',
+      m.currM3?.toStringAsFixed(3) ?? '',
+      _fmtDate(m.prevDate),
+      _fmtDate(m.currDate),
+      alarms,
+      m.frameCount.toString(),
+      _fmtDateTime(m.readAt),
+    ]);
+  }
+  return const ListToCsvConverter(fieldDelimiter: ';').convert(rows);
+}
+
+/// Export raw frames buffer to CSV string.
+String exportRawFramesToCsv(List<({DateTime ts, int? radioNum, String reason, String hex})> frames) {
+  final rows = <List<String>>[
+    ['Timestamp', 'Radio ID', 'Reason', 'Raw hex'],
+  ];
+  for (final f in frames) {
+    rows.add([
+      _fmtDateTime(f.ts),
+      f.radioNum?.toString() ?? '',
+      f.reason,
+      f.hex,
+    ]);
+  }
+  return const ListToCsvConverter(fieldDelimiter: ';').convert(rows);
+}
+
 /// Save CSV to Downloads / temp and return file path.
 Future<String> saveCsvFile(String content, String filename) async {
   final dir = await getTemporaryDirectory();

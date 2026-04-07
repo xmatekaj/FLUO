@@ -60,10 +60,9 @@ List<Uint8List> extractFrames(List<int> buf) {
     final L = buf[i + 1];
     final payloadLen = L - 9;
     if (payloadLen <= 0) { i++; continue; }
-    final nCrc  = ((payloadLen + 15) ~/ 16);
-    // Frame: SOF(1)+L(1)+C(1)+M(2)+A(6)+data(payloadLen)+dataCRCs(nCrc*2)
-    // (Adeunis-RF dongle does NOT include header CRC)
-    final total = 11 + payloadLen + nCrc * 2;
+    // The USB dongle outputs raw payload bytes WITHOUT block-level CRCs.
+    // Frame layout: SOF(1)+L(1)+C(1)+M(2)+A(6)+payloadData(payloadLen)
+    final total = 11 + payloadLen;
     if (i + total > buf.length) break;
     frames.add(Uint8List.fromList(buf.sublist(i, i + total)));
     i += total;
@@ -117,35 +116,11 @@ ParsedFrame? parseRawFrame(Uint8List raw) {
 
   final payloadLen = lField - 9;
   if (payloadLen <= 0) return null;
-  final nBlocks = ((payloadLen + 15) ~/ 16);
 
-  // Data blocks start at raw[11] (no header CRC from this dongle)
-  final rawBlocks = raw.sublist(11);
-
-  // Strip data-block CRCs
-  final out = <int>[];
-  int off = 0;
-  bool crcOk = true;
-  for (int i = 0; i < nBlocks; i++) {
-    final blen = (i < nBlocks - 1 || payloadLen % 16 == 0) ? 16 : payloadLen % 16;
-    final end = off + blen + 2;
-    if (end > rawBlocks.length) {
-      debugPrint('WMBUS CRC: block $i short: need $end have ${rawBlocks.length}');
-      crcOk = false; break;
-    }
-    final blk = rawBlocks.sublist(off, end);
-    final ok = _checkCrc(Uint8List.fromList(blk));
-    if (!ok) {
-      debugPrint('WMBUS CRC: block $i FAIL data=${blk.sublist(0,math.min(4,blen)).map((b)=>b.toRadixString(16).padLeft(2,"0")).join()} crc=${blk[blen].toRadixString(16).padLeft(2,"0")}${blk[blen+1].toRadixString(16).padLeft(2,"0")}');
-      crcOk = false; break;
-    }
-    out.addAll(blk.sublist(0, blen));
-    off += blen + 2;
-  }
-
-  final blockData = crcOk
-      ? Uint8List.fromList(out)
-      : rawBlocks.sublist(0, math.min(payloadLen, rawBlocks.length));
+  // Data payload starts at raw[11] (no header CRC, no block CRCs from this dongle).
+  // Payload bytes are raw/unencrypted header + encrypted data, no CRC bytes embedded.
+  final blockData = raw.sublist(11, math.min(11 + payloadLen, raw.length));
+  final crcOk = true; // dongle strips block CRCs; skip CRC verification
 
   return ParsedFrame(
     lField: lField,
