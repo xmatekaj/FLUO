@@ -43,7 +43,8 @@ Anyone who uses this software (including as a network service) is required to re
 
 ## Screenshots
 
-![](screenshots/1.jpg "FLUO")
-![](screenshots/2.jpg "FLUO")
-![](screenshots/3.jpg "FLUO")
+<img src="screenshots/1.jpg" width="300"/><br>
+<img src="screenshots/2.jpg" width="300"/><br>
+<img src="screenshots/3.jpg" width="300"/>
+
 
