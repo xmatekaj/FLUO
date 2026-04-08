@@ -39,3 +39,11 @@ flutter build apk
 This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
 
 Anyone who uses this software (including as a network service) is required to release the complete source code under the same terms. See the [LICENSE](LICENSE) file for details.
+
+
+## Screenshots
+
+![](screenshots/1.jpg "FLUO")
+![](screenshots/2.jpg "FLUO")
+![](screenshots/3.jpg "FLUO")
+
