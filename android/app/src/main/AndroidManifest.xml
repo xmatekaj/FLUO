@@ -3,6 +3,13 @@
     <!-- USB Host (OTG dongle) -->
     <uses-feature android:name="android.hardware.usb.host" android:required="false" />
 
+    <!-- Bluetooth Classic (RFCOMM) for Apator module communication -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
     <application
         android:label="FLUO"
         android:name="${applicationName}"

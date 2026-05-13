@@ -10,8 +10,11 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # USB serial (USB OTG – CDC-ACM, FTDI, CP210x, CH34x)
+  # USB serial (USB OTG – CDC-ACM, FTDI, CP210x, CH34x) — Android only
   usb_serial: ^0.5.2
+
+  # libserialport binding — Linux/macOS/Windows desktop
+  flutter_libserialport: ^0.4.0
 
   # AES-128-CBC decryption
   encrypt: ^5.0.3
@@ -24,6 +27,9 @@ dependencies:
   share_plus: ^10.1.4
   path_provider: ^2.1.5
 
+  # Runtime permissions (BT on Android 12+)
+  permission_handler: ^11.3.1
+
   cupertino_icons: ^1.0.8
 
 dev_dependencies:
@@ -35,3 +41,12 @@ flutter:
   uses-material-design: true
   assets:
     - assets/meters_template.csv
+    - assets/js1.6_at16.inp
+    - assets/js1.6_at16_r160.inp
+    - assets/js2.5_at16.inp
+    - assets/js2.5_at16_r160.inp
+    - assets/js4_at16.inp
+    - assets/js4_at16_r160.inp
+    - assets/smart_1-6_sm_at08.inp
+    - assets/smart_2-5_sm_at08.inp
+    - assets/smart_4-0_sm_at08.inp

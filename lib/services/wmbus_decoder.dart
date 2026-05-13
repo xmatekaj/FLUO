@@ -48,21 +48,111 @@ bool _checkCrc(Uint8List block) {
 
 // ── Frame extraction from byte stream ────────────────────────────────────────
 
+/// Extract complete W-MBus frames from Apator BT module in FramesListening mode.
+///
+/// Protocol: SOF=0x02 [escaped payload] EOF=0x03
+/// Escape: 0x10 XX → byte (XX + 128)
+///
+/// After unescaping, the payload is a raw wMBus frame (L + C + M + A + data).
+/// We prepend SOF=0xFF so the result is compatible with [parseRawFrame].
+///
+/// Consumed bytes are removed from the front of [buf].
+List<Uint8List> extractBtFrames(List<int> buf) {
+  final frames = <Uint8List>[];
+  int i = 0;
+
+  while (i < buf.length) {
+    // Find SOF = 0x02
+    if (buf[i] != 0x02) { i++; continue; }
+
+    // Find EOF = 0x03
+    int end = -1;
+    for (int j = i + 1; j < buf.length; j++) {
+      if (buf[j] == 0x03) { end = j; break; }
+    }
+    if (end < 0) break; // incomplete frame, wait for more data
+
+    // Unescape payload between SOF and EOF
+    final payload = <int>[];
+    bool escaped = false;
+    for (int j = i + 1; j < end; j++) {
+      if (escaped) {
+        payload.add((buf[j] + 128) & 0xFF);
+        escaped = false;
+      } else if (buf[j] == 0x10) {
+        escaped = true;
+      } else {
+        payload.add(buf[j]);
+      }
+    }
+
+    if (payload.length > 2) {
+      // Skip 2-byte BT module prefix (RSSI + status) then prepend 0xFF SOF
+      frames.add(Uint8List.fromList([0xFF, ...payload.sublist(2)]));
+    }
+    i = end + 1;
+  }
+
+  buf.removeRange(0, i);
+  return frames;
+}
+
 /// Extract complete W-MBus frames from a mutable buffer.
 /// Consumed bytes are removed from the front of [buf].
 /// Returns list of complete raw frames.
+///
+/// Adeunis ARF8020AA emits two formats:
+///   RX broadcasts:  0xFF [L] [C=0x44] [M] [A] [data...]   — length = L+2
+///   RX RSP-UD:      0xFF [L] [C=0x08] [M] [A] [CI=0x7A] [TPL+enc] [trailer]
+///                   — actual length is ~L+13B due to extra Adeunis trailer.
+///   TX bidir:       0xFF 0xFE [...]                       — skipped here.
 List<Uint8List> extractFrames(List<int> buf) {
   final frames = <Uint8List>[];
   int i = 0;
   while (i < buf.length) {
     if (buf[i] != 0xFF) { i++; continue; }
     if (i + 1 >= buf.length) break;
+    // Skip TX bidirectional frames (FF FE prefix) — handled separately
+    if (buf[i + 1] == 0xFE) {
+      // Find next SOF after at least 12 bytes; consume up to it
+      int end = -1;
+      for (int j = i + 12; j < buf.length; j++) {
+        if (buf[j] == 0xFF && (j + 1 >= buf.length || buf[j + 1] != 0xFE)) {
+          end = j; break;
+        }
+      }
+      if (end < 0) break; // wait for more
+      i = end;
+      continue;
+    }
     final L = buf[i + 1];
     final payloadLen = L - 9;
     if (payloadLen <= 0) { i++; continue; }
-    // The USB dongle outputs raw payload bytes WITHOUT block-level CRCs.
-    // Frame layout: SOF(1)+L(1)+C(1)+M(2)+A(6)+payloadData(payloadLen)
-    final total = 11 + payloadLen;
+
+    // Standard frame length = SOF(1) + L(1) + C(1) + M(2) + A(6) + payload
+    int total = 11 + payloadLen;
+
+    // Special: APA RSP-UD (C=0x08, M=0x0601) frames have ~13B extra trailer
+    // (Adeunis-specific RSSI/AFC bytes). Need full 49B (= L+2+13).
+    if (i + 5 < buf.length &&
+        buf[i + 2] == 0x08 && buf[i + 3] == 0x01 && buf[i + 4] == 0x06) {
+      const trailerLen = 13;
+      // Wait until we have either next SOF or at least total+trailerLen bytes
+      final maxEnd = math.min(i + 64, buf.length);
+      int extEnd = -1;
+      for (int j = i + total; j < maxEnd; j++) {
+        if (buf[j] == 0xFF) { extEnd = j; break; }
+      }
+      if (extEnd > 0) {
+        total = extEnd - i;
+      } else if (buf.length - i >= total + trailerLen) {
+        total = total + trailerLen;
+      } else {
+        // Not enough data yet — break and wait for more bytes
+        break;
+      }
+    }
+
     if (i + total > buf.length) break;
     frames.add(Uint8List.fromList(buf.sublist(i, i + total)));
     i += total;
@@ -75,6 +165,7 @@ List<Uint8List> extractFrames(List<int> buf) {
 
 class ParsedFrame {
   final int lField;
+  final int cField;         // C-field (0x44=broadcast, 0x08=RSP-UD, 0x53/0x73=SND-UD, ...)
   final Uint8List mBytes;   // 2 bytes
   final Uint8List aBytes;   // 6 bytes
   final int sw;
@@ -84,6 +175,7 @@ class ParsedFrame {
   final bool crcOk;
   ParsedFrame({
     required this.lField,
+    required this.cField,
     required this.mBytes,
     required this.aBytes,
     required this.sw,
@@ -92,6 +184,12 @@ class ParsedFrame {
     required this.blockData,
     required this.crcOk,
   });
+
+  /// True if this is a service response (RSP-UD from slave to master).
+  bool get isRspUd => cField == 0x08 || cField == 0x18 || cField == 0x88;
+
+  /// True if this is a standard broadcast (SND-NR).
+  bool get isBroadcast => cField == 0x44;
 }
 
 /// Parse raw frame bytes (SOF=0xFF prefix).
@@ -101,6 +199,7 @@ ParsedFrame? parseRawFrame(Uint8List raw) {
   if (raw.isEmpty || raw[0] != 0xFF || raw.length < 12) return null;
 
   final lField    = raw[1];
+  final cField    = raw[2];
   final mBytes    = raw.sublist(3, 5);
   final aBytes    = raw.sublist(5, 11);
   final idBytes   = aBytes.sublist(0, 4);
@@ -118,12 +217,14 @@ ParsedFrame? parseRawFrame(Uint8List raw) {
   if (payloadLen <= 0) return null;
 
   // Data payload starts at raw[11] (no header CRC, no block CRCs from this dongle).
-  // Payload bytes are raw/unencrypted header + encrypted data, no CRC bytes embedded.
-  final blockData = raw.sublist(11, math.min(11 + payloadLen, raw.length));
+  // Take from byte 11 to end of raw frame — for RSP-UD (C=0x08) the actual
+  // encrypted block extends beyond L (extractor accounts for Adeunis trailer).
+  final blockData = raw.sublist(11);
   final crcOk = true; // dongle strips block CRCs; skip CRC verification
 
   return ParsedFrame(
     lField: lField,
+    cField: cField,
     mBytes: Uint8List.fromList(mBytes),
     aBytes: Uint8List.fromList(aBytes),
     sw: sw,
@@ -562,6 +663,9 @@ class Apa162HistEntry {
 class Apa162Result {
   double? totalM3;
   List<Apa162HistEntry> history = [];
+  /// Raw tagged values from the plaintext (tag id → raw data bytes).
+  /// Useful for service responses (RSP-UD) where tags carry register values.
+  Map<int, Uint8List> rawTags = {};
 }
 
 /// Returns true if [payload] (decrypted blockData) looks like Apator 162 format.
@@ -570,6 +674,230 @@ bool isApa162Payload(Uint8List payload) =>
     payload[0] == 0x2F &&
     payload[1] == 0x2F &&
     payload[2] == 0x0F;
+
+// ── Apator T2 READ command builder (master→slave) ────────────────────────────
+//
+// Reverse engineered from Inkasent PC 4 .NET assemblies (AT.dll). Format:
+//   wMBus DLL: [L] [C=0x5B REQ-UD2] [M=0x0601 APA] [A=4B BCD ID + SW + HW]
+//   CI=0x5B (CMDToDevice12Bytes)
+//   Long Header (12B): A(4) + M(2) + SW + Hw + ACC + Status + ConfigField(2)
+//   Encrypted application data (AES-CBC mode 5):
+//     [2F 2F]              ← verification bytes
+//     [0F]                 ← DIF manufacturer-specific
+//     [4B RtcClock4B]      ← OMS Type-F datetime
+//     [1B Codes.Read = 1]  ← opcode
+//     [N×1B register IDs]
+//     [0xFF padding]
+//     [CRC-16 wMBus 2B]
+//     [0x2F padding to next 16B boundary]
+//   IV = M(2) + ID(4) + SW(1) + Hw(1) + ACC×8
+
+/// Encode a DateTime as 4-byte OMS Type-F datetime (used by Apator RtcClock4B).
+Uint8List encodeRtcClock4B(DateTime dt, {bool summerTime = false, bool activateTimeChange = false}) {
+  final dow = dt.weekday; // 1..7 ISO (Monday=1, Sunday=7)
+  final out = Uint8List(4);
+  out[0] = ((dt.minute & 0x3F) | ((dt.hour << 6) & 0xC0)) & 0xFF;
+  out[1] = ((dt.day & 0x1F) | ((dt.hour << 3) & 0xE0)) & 0xFF;
+  out[2] = ((dt.month & 0x0F) | (summerTime ? 0x10 : 0) | ((dow << 5) & 0xE0)) & 0xFF;
+  out[3] = (((dt.year - 2000) & 0x7F) | (activateTimeChange ? 0x80 : 0)) & 0xFF;
+  return out;
+}
+
+/// Convert decimal radio number to 4-byte BCD little-endian (as used in A-field).
+/// e.g. 1243242 → bytes [0x42, 0x32, 0x24, 0x01]
+Uint8List radioToBcdLE(int radioNumber) {
+  final s = radioNumber.toString().padLeft(8, '0');
+  final out = Uint8List(4);
+  // Pairs of digits, LE: lowest pair first
+  for (int i = 0; i < 4; i++) {
+    final hi = int.parse(s[6 - 2 * i]);
+    final lo = int.parse(s[7 - 2 * i]);
+    out[i] = (hi << 4) | lo;
+  }
+  return out;
+}
+
+/// Build the encrypted application data payload (before AES) for a READ command.
+/// Layout: [2F 2F][0F DIF][clock 4B][Code=0x01][reg IDs][0xFF padding][CRC 2B][0x2F pad to 16B]
+Uint8List buildApatorReadPlaintext(List<int> regIds, DateTime now) {
+  final clock = encodeRtcClock4B(now);
+  // parametersData = 4B clock + 1B Code.Read + N×reg_id
+  final params = <int>[...clock, 0x01, ...regIds];
+
+  // AdjustDataSizeAndAppendCrc (from decompiled C#):
+  //   num = params.length + 2 (CRC) + 1 (DIF)
+  //   num3 = round up to (multiple of 16) such that DIF+params+padding+CRC = 16N
+  final num = params.length + 3;
+  final mod = num % 16;
+  final num3 = (mod <= 14) ? (num + 14 - mod) : (num + 16 - mod + 14);
+  // base.Data length = num3 - 1 (DIF will be embedded separately via DIB, but we keep it inline)
+
+  // Build array: [0x0F][params][0xFF padding][CRC 2B]
+  // Length matches C# logic: array.Length = num3 - 1; but we add DIF+CRC explicitly here.
+  final preCrc = Uint8List(num3 - 1);
+  preCrc[0] = 0x0F;
+  for (int i = 0; i < params.length; i++) {
+    preCrc[1 + i] = params[i] & 0xFF;
+  }
+  // Fill rest with 0xFF (before CRC slot)
+  for (int i = 1 + params.length; i < preCrc.length - 2; i++) {
+    preCrc[i] = 0xFF;
+  }
+  // CRC over [0..length-3] inclusive (i.e. length-2 bytes — DIF + params + padding without CRC)
+  // Crc16Wmbus.CalculateCrc XORs result bytes with 0xFF (~ bitwise NOT in C#)
+  final crc = _crc16(preCrc.sublist(0, preCrc.length - 2));
+  preCrc[preCrc.length - 2] = ((crc >> 8) & 0xFF) ^ 0xFF;
+  preCrc[preCrc.length - 1] = (crc & 0xFF) ^ 0xFF;
+
+  // Final plaintext = [2F 2F] + preCrc[1..] (skip DIF — it's at start of preCrc)
+  // Wait: the C# code shifts left to remove DIF. But the plaintext seen on the wire
+  // INCLUDES the 0x0F marker (we observed it in RSP-UD). So we keep DIF in plaintext.
+  // Plaintext to encrypt: [2F 2F] + preCrc (which is [0F + params + 0xFF pad + CRC])
+  // Total = 2 + (num3 - 1) = num3 + 1 bytes.
+  // Pad to 16B boundary with 0x2F.
+  final totalSize = ((2 + preCrc.length + 15) ~/ 16) * 16;
+  final plaintext = Uint8List(totalSize);
+  plaintext[0] = 0x2F;
+  plaintext[1] = 0x2F;
+  plaintext.setRange(2, 2 + preCrc.length, preCrc);
+  for (int i = 2 + preCrc.length; i < totalSize; i++) {
+    plaintext[i] = 0x2F;
+  }
+  return plaintext;
+}
+
+/// AES-CBC encrypt with given key + IV. Pads to 16B if needed.
+Uint8List? encryptCbc(List<int> key, Uint8List iv, Uint8List plaintext) {
+  if (plaintext.length % 16 != 0) return null;
+  try {
+    final k = enc.Key(Uint8List.fromList(key));
+    final i = enc.IV(iv);
+    final cipher = enc.Encrypter(enc.AES(k, mode: enc.AESMode.cbc, padding: null));
+    return Uint8List.fromList(
+      cipher.encryptBytes(plaintext, iv: i).bytes,
+    );
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Compute wMBus block-level CRC-16 (poly 0x3D65, XOR result with 0xFF).
+Uint8List _wmbusBlockCrc(Uint8List block) {
+  final c = _crc16(block);
+  return Uint8List.fromList([
+    ((c >> 8) & 0xFF) ^ 0xFF,
+    (c & 0xFF) ^ 0xFF,
+  ]);
+}
+
+/// Add wMBus mode A block-level CRC-16 to a frame.
+/// Layout: [10B header] [2B CRC] [16B block] [2B CRC] [16B block] [2B CRC] ...
+/// Returns new buffer with CRCs inserted.
+Uint8List addWmbusBlockCrcs(Uint8List frameNoCrc) {
+  // First block is 10 bytes (header = L+C+M+A+Sw+Hw)
+  if (frameNoCrc.length < 10) return frameNoCrc;
+  final result = BytesBuilder();
+  // Header block (10B)
+  final headerBlock = frameNoCrc.sublist(0, 10);
+  result.add(headerBlock);
+  result.add(_wmbusBlockCrc(headerBlock));
+  // Subsequent data blocks of up to 16B
+  int i = 10;
+  while (i < frameNoCrc.length) {
+    final blockLen = math.min(16, frameNoCrc.length - i);
+    final block = frameNoCrc.sublist(i, i + blockLen);
+    result.add(block);
+    result.add(_wmbusBlockCrc(block));
+    i += blockLen;
+  }
+  return result.toBytes();
+}
+
+/// Build full T2 READ command frame (without Adeunis FF FE prefix).
+/// Adeunis txT2Frame() will prepend FF FE.
+/// Returns: [L][C=5B][M=0106][A=BCD+SW+HW][CI=5B][LongHeader 12B][encrypted N*16B]
+/// With [withBlockCrcs] = true also adds wMBus mode A block-level CRC-16 after
+/// each 16-byte block (some dongles require this; some add automatically).
+Uint8List buildApatorReadFrame({
+  required int radioNumber,
+  required int sw,
+  required int hw,
+  required int accessNumber,
+  required List<int> regIds,
+  required DateTime now,
+  required List<int> aesKey,
+  bool withBlockCrcs = false,
+}) {
+  final bcdA = radioToBcdLE(radioNumber);
+  const mField = [0x01, 0x06]; // APA LE
+
+  // Plaintext + AES encrypt
+  final plaintext = buildApatorReadPlaintext(regIds, now);
+  final nEncBlocks = plaintext.length ~/ 16;
+  // ConfigurationField (2B LE) layout per Inkasent decompile:
+  //   signature[0]: bits 4-7 = NumberOfEncryptedBlocks, bits 2-3 = ContentOfMessage,
+  //                 bit 0 = HopCounter
+  //   signature[1]: bits 0-3 = EncryptionMode (5 = AES-CBC mode 5),
+  //                 bit 5 = Synchronus, bit 6 = Accesibility,
+  //                 bit 7 = BidirectionalCommunication (MUST be set for T2 commands!)
+  // For READ master→slave: bidir + encmode=5 + n_enc → signature[1]=0x85, signature[0]=(n<<4)
+  final configWord = 0x8000 | (5 << 8) | (nEncBlocks << 4);
+  final cfgBytes = [configWord & 0xFF, (configWord >> 8) & 0xFF];
+
+  // IV per long header
+  final iv = Uint8List.fromList([
+    ...mField,                                                // M (2B)
+    bcdA[0], bcdA[1], bcdA[2], bcdA[3],                       // A_id (4B)
+    sw, hw,                                                    // SW + HW
+    accessNumber, accessNumber, accessNumber, accessNumber,    // ACC × 8
+    accessNumber, accessNumber, accessNumber, accessNumber,
+  ]);
+
+  final encrypted = encryptCbc(aesKey, iv, plaintext);
+  if (encrypted == null) {
+    throw Exception('AES encrypt failed');
+  }
+
+  // wMBus DLL header
+  // Length L = sizeof(C+M+A+CI+LongHeader+encrypted) = 1+2+6+1+12+(N*16) = 22 + N*16
+  // Frame: [L][C=5B][M][A=BCD+SW+HW][CI=5B][LongHeader 12B][encrypted]
+  // Long Header layout: [A_id 4B BCD][M 2B LE][Sw][MeterType=Hw][AccessNumber][Status=0][Config 2B LE]
+  final longHeader = Uint8List.fromList([
+    bcdA[0], bcdA[1], bcdA[2], bcdA[3],   // A_id BCD (4B)
+    mField[0], mField[1],                  // M (2B LE)
+    sw,                                     // SW
+    hw,                                     // MeterType / HW
+    accessNumber,                           // ACC
+    0x00,                                   // Status
+    cfgBytes[0], cfgBytes[1],               // Config (2B LE)
+  ]);
+
+  // A-field in DLL (6B) = ID(4 BCD) + SW + HW (same as TPL header start; some redundancy)
+  final aField = Uint8List.fromList([bcdA[0], bcdA[1], bcdA[2], bcdA[3], sw, hw]);
+
+  // wMBus L = number of bytes AFTER L (= C+M+A+CI+LongHeader+encrypted)
+  final innerLen = 1 + 2 + 6 + 1 + 12 + encrypted.length;
+  final frame = Uint8List(1 + innerLen);
+  int p = 0;
+  frame[p++] = innerLen;      // L value
+  frame[p++] = 0x5B;          // C-field REQ-UD2
+  frame[p++] = mField[0];
+  frame[p++] = mField[1];
+  for (final b in aField) {
+    frame[p++] = b;
+  }
+  frame[p++] = 0x5B;          // CI-field CMDToDevice12Bytes
+  for (final b in longHeader) {
+    frame[p++] = b;
+  }
+  for (final b in encrypted) {
+    frame[p++] = b;
+  }
+  if (withBlockCrcs) {
+    return addWmbusBlockCrcs(frame);
+  }
+  return frame;
+}
 
 /// Parse decrypted Apator 162 plaintext payload.
 /// [payload] is the full plaintext starting with 0x2F 0x2F.
@@ -584,6 +912,11 @@ Apa162Result parseApa162Payload(Uint8List payload) {
     final tag = payload[i++];
     final size = _apa162TagSize(tag);
     if (size == null || i + size > payload.length) break;
+
+    // Save raw bytes of every tag (skip end-marker 0xFF/empty tags)
+    if (size > 0) {
+      result.rawTags[tag] = Uint8List.fromList(payload.sublist(i, i + size));
+    }
 
     if (tag == 0x10) {
       // Total volume in litres (LE uint32)

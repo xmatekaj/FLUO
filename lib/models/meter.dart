@@ -72,6 +72,11 @@ class UnknownMeter {
   final int radioNum;
   UnknownMeterKind kind;
 
+  // wMBus frame metadata (from A-field)
+  int sw;   // software version from wMBus frame
+  int hw;   // hardware version from wMBus frame
+  bool isApator; // manufacturer = Apator (M=0x0601)
+
   // Water (Techem A2 or Apator zero-key)
   double? totalM3;
   double? prevM3;
@@ -95,6 +100,9 @@ class UnknownMeter {
   UnknownMeter({
     required this.radioNum,
     required this.kind,
+    this.sw = 0,
+    this.hw = 0,
+    this.isApator = false,
     this.totalM3,
     this.prevM3,
     this.currM3,
